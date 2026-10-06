@@ -104,68 +104,79 @@ TEMPORAL_SPATIAL_FILTER = ee.Filter.And(
   )
 ) 
 
-def match_and_reduce(sites, image_col, scale):
+def match_and_reduce(sites, image_col, scale, band0, days=10):
+    ms = days * 24 * 60 * 60 * 1000
+    filt = ee.Filter.And(
+        ee.Filter.maxDifference(difference=ms,
+                                leftField='system:time_start',
+                                rightField='system:time_start'),
+        ee.Filter.intersects(leftField='.geo', rightField='.geo'))
+    join = ee.Join.saveAll(matchesKey='candidates', outer=True)
+    joined = join.apply(sites, image_col, filt)
+
+    def pick(feature):
+        t = ee.Number(feature.get('system:time_start'))
+        cands = ee.List(feature.get('candidates'))
+
+        def per_img(img):
+            img = ee.Image(img)
+            vals = img.reduceRegion(
+                reducer=ee.Reducer.median(), geometry=feature.geometry(),
+                scale=scale, maxPixels=1e9, bestEffort=True)
+            return (ee.Feature(None, vals)
+                    .set('diff', t.subtract(ee.Number(img.get('system:time_start'))).abs())
+                    .set('img_date', img.date().format('YYYY-MM-dd')))
+
+        fc = (ee.FeatureCollection(cands.map(per_img))
+              .filter(ee.Filter.notNull([band0]))
+              .sort('diff'))
+
+        def with_best():
+            best = ee.Feature(fc.first())
+            props = best.toDictionary().remove(['diff', 'img_date'])
+            new_keys = props.keys().map(lambda k: ee.String(k).cat('_0'))
+            return (feature.set(ee.Dictionary.fromLists(new_keys, props.values()))
+                    .set('matched_img_date', best.get('img_date')))
+
+        out = ee.Feature(ee.Algorithms.If(fc.size().gt(0), with_best(), feature))
+        return out.set('candidates', None)
+
+    return joined.map(pick)
+    
+def matchAndReduce_at(sites, imageCol, scale, days, suffix, tol_days=10):
+    ms = 24 * 60 * 60 * 1000
+
+    def add_lag(f):
+        return f.set('lag_time',
+                     ee.Number(f.get('system:time_start')).subtract(days * ms))
+    lagged = sites.map(add_lag)
+
     def imgfind(feature):
-        closest_image = ee.Image(feature.get('closestImage'))
-        medians = closest_image.reduceRegion(
+        img = ee.Image(feature.get('closestImage'))
+        values = img.reduceRegion(
             reducer=ee.Reducer.median(),
             geometry=feature.geometry(),
             scale=scale,
             maxPixels=1e9,
-            bestEffort=True
-        )
-        new_keys = medians.keys().map(lambda k: ee.String(k).cat('_0'))
-        renamed = ee.Dictionary.fromLists(new_keys, medians.values())
-        return (feature.set(renamed)
-                .set('matched_img_date', closest_image.date().format('YYYY-MM-dd')))
-
-    join = ee.Join.saveBest(
-        matchKey='closestImage',
-        measureKey='timeDiff'
-    )
-    # back to using the shared filter
-    joined = join.apply(sites, image_col, TEMPORAL_SPATIAL_FILTER)
-    return joined.map(imgfind)
-    
-def matchAndReduce_at(sites, imageCol, scale, days, suffix):
-    def imgfind(feature):
-        img = ee.Image(feature.get('closestImage'))
-        values = img.reduceRegion(
-            reducer=    ee.Reducer.median(),
-            geometry=   feature.geometry(),
-            scale=      scale,
-            maxPixels=  1e9,
-            bestEffort= True
-        )
-        # renaming each band with the suffix
+            bestEffort=True)
         new_keys = values.keys().map(lambda k: ee.String(k).cat(suffix))
         renamed = ee.Dictionary.fromLists(new_keys, values.values())
+        # actual days between the site date and the matched image
+        actual = (ee.Number(feature.get('system:time_start'))
+                  .subtract(ee.Number(img.get('system:time_start')))
+                  .divide(ms))
         return (feature.set(renamed)
-                .set('dateDiff' + suffix, feature.get('dateDiff')))
-            
+                .set('daysBefore' + suffix, actual)
+                .set('img_date' + suffix, img.date().format('YYYY-MM-dd')))
+
     FILTER = ee.Filter.And(
-        ee.Filter.maxDifference(
-            difference= days * 24 * 60 * 60 * 1000,
-            leftField=  'system:time_start',
-            rightField= 'system:time_start'
-        ),
-        ee.Filter.greaterThanOrEquals(
-            leftField=  'system:time_start',
-            rightField= 'system:time_start'
-        ),
-        ee.Filter.intersects(
-            leftField= '.geo',
-            rightField= '.geo'
-        )
-    )
-    
-    join = ee.Join.saveBest(
-        matchKey= 'closestImage',
-        measureKey= 'dateDiff'
-    )
-    
-    joined = join.apply(sites,imageCol, FILTER)
-    return joined.map(imgfind)
+        ee.Filter.maxDifference(difference=tol_days * ms,
+                                leftField='lag_time',
+                                rightField='system:time_start'),
+        ee.Filter.intersects(leftField='.geo', rightField='.geo'))
+
+    join = ee.Join.saveBest(matchKey='closestImage', measureKey='lagDiff')
+    return join.apply(lagged, imageCol, FILTER).map(imgfind)
 
 
 def matchAndReduce30(sites, imageCol, scale):
@@ -234,7 +245,7 @@ def FMport(start_date, end_date, pf_type, folder='GEE_Py_Data'):
 
     def combine_each(current, config):
         processed = preprocess(config, image_start, end_date)
-        output0 = match_and_reduce(current, processed, config['scale'])
+        output0 = match_and_reduce(current, processed, config['scale'], config['newnames'][0])
         output30 = matchAndReduce30(output0, processed, config['scale'])
         output60 = matchAndReduce60(output30, processed, config['scale'])
         # output90 = matchAndReduce90(output60,processed, config['scale'])
@@ -270,6 +281,13 @@ def FMbatch(start_date, end_date, pf_type, folder='GEE_Py_Data', chunk_months=12
         tasks.append(task)
         window_start = window_end
     return tasks
+
+
+
+
+
+
+
 
 
 
